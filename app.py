@@ -7,18 +7,17 @@ import requests
 import warnings
 warnings.filterwarnings('ignore')
 
-# 網頁基本設定 (必須放在所有 Streamlit 語法的最前面)
 st.set_page_config(page_title="AI 量化指揮中心", page_icon="📈", layout="wide")
 
 # ==========================================
 # 🔒 密碼登入系統 (防呆穩定版)
 # ==========================================
 def check_password():
-    """檢查密碼是否正確，正確才回傳 True"""
     def password_entered():
-        # 預設密碼為 8888，可自行修改
+        # 🌟 修正點 1：使用 .get()，如果找不到密碼變數就不會報錯，而是回傳空字串
         if st.session_state.get("password", "") == "8888":
             st.session_state["password_correct"] = True
+            # 🌟 修正點 2：拿掉 del st.session_state["password"]，讓系統自己處理
         else:
             st.session_state["password_correct"] = False
 
@@ -35,53 +34,29 @@ def check_password():
     else:
         return True
 
-# 密碼未通過則強制中斷
 if not check_password():
     st.stop()
 
 
 # ==========================================
-# 📈 核心資料處理與特徵工程
+# 📈 核心資料處理
 # ==========================================
-@st.cache_data(ttl=300) # 🌟 修正點 1：將快取TTL縮短為 300 秒 (5分鐘)，提高即時性
+@st.cache_data(ttl=900) # 快取時間縮短為 15 分鐘，確保夜盤抓到最新報價
 def get_data(symbol, days):
     ticker = f"{symbol}.TW"
     stock = yf.Ticker(ticker)
-    
-    # --- 1. 抓取歷史日線資料 (用於 AI 訓練與均線計算) ---
-    # 背景固定抓取 250 天，確保長週期技術指標計算完全正確
-    df = stock.history(period="250d").reset_index()
-    if df.empty: return df, [], f"台股 {symbol}", 0.0
-    
-    df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None).dt.floor('D')
-    
-    # 強制刪除收盤價為 NaN 的幽靈 K 線
-    df = df.dropna(subset=['Close'])
-    
-    # 基設股價 (預設為昨天收盤價，防止今日未開盤時報錯)
-    price = float(df['Close'].iloc[-1])
-    
-    # 🌟 修正點 2：安全抓取名稱，若 yfinance 當機則預設顯示「台股 XXXX」
     try:
-        name = stock.info.get('longName', stock.info.get('shortName', f"台股 {symbol}"))
+        name = stock.info.get('longName', stock.info.get('shortName', '未知'))
+        price = stock.info.get('regularMarketPrice', stock.info.get('currentPrice', None))
     except:
-        name = f"台股 {symbol}"
-    
-    # 🌟 修正點 3：新增盤中即時報價抓取邏輯
-    # 單獨抓取今天的 1 分鐘 K 線，只取最後一筆
-    try:
-        # yf.download 抓取今日 1d 資料，interval 設為 1m
-        today_fetch = yf.download(ticker, period="1d", interval="1m", progress=False)
-        if not today_fetch.empty:
-            # 找到最後一個有效的成交價
-            last_valid_price = today_fetch['Close'].ffill().iloc[-1]
-            if not pd.isna(last_valid_price):
-                price = float(last_valid_price)
-    except Exception as e:
-        # 如果抓取即時資料失敗 (例如 yfinance API 流量限制)，則延用日線最後一筆價格 (昨天收盤價)
-        pass
+        name, price = "未知名稱", None
 
-    # 1. 大盤加權指數連動 (日盤)
+    df = stock.history(period="250d").reset_index()
+    if df.empty: return df, [], name, price
+    df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None).dt.floor('D')
+    if price is None: price = df['Close'].iloc[-1]
+    
+    # 1. 大盤連動 (日盤)
     market = yf.Ticker("^TWII").history(period="250d").reset_index()
     if not market.empty:
         market['Date'] = pd.to_datetime(market['Date']).dt.tz_localize(None).dt.floor('D')
@@ -95,16 +70,18 @@ def get_data(symbol, days):
     else:
         df['Market_Return'], df['Market_Trend'], df['Relative_Strength'] = 0, 0, 0
 
-    # 2. 🌙 夜盤動能：台積電 ADR (TSM) 與 那斯達克 (^IXIC)
+    # 🌟 2. 加入美股與夜盤動能 (TSMC ADR & 那斯達克)
+    # 抓取台積電 ADR
     adr = yf.Ticker("TSM").history(period="250d").reset_index()
     if not adr.empty:
         adr['Date'] = pd.to_datetime(adr['Date']).dt.tz_localize(None).dt.floor('D')
         adr = adr[['Date', 'Close']].rename(columns={'Close': 'ADR_Close'})
-        df = df.merge(adr, on='Date', how='left').ffill()
+        df = df.merge(adr, on='Date', how='left').ffill() # 美股休市時沿用前一天
         df['ADR_Return'] = df['ADR_Close'].pct_change()
     else:
         df['ADR_Return'] = 0
 
+    # 抓取那斯達克指數
     nasdaq = yf.Ticker("^IXIC").history(period="250d").reset_index()
     if not nasdaq.empty:
         nasdaq['Date'] = pd.to_datetime(nasdaq['Date']).dt.tz_localize(None).dt.floor('D')
@@ -114,7 +91,7 @@ def get_data(symbol, days):
     else:
         df['NDX_Return'] = 0
 
-    # 3. 🏦 籌碼大戶：FinMind 三大法人買賣超
+    # 3. 籌碼大戶
     start_date_str = (pd.Timestamp.today() - pd.Timedelta(days=250)).strftime('%Y-%m-%d')
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={symbol}&start_date={start_date_str}"
     try:
@@ -131,7 +108,7 @@ def get_data(symbol, days):
     except:
         df['Inst_Net_Buy'] = 0 
 
-    # 4. 技術指標計算
+    # 4. 技術指標
     for d in [5, 10, 20]: df[f'MA{d}'] = df['Close'].rolling(window=d).mean()
     low_min = df['Low'].rolling(window=9).min()
     high_max = df['High'].rolling(window=9).max()
@@ -141,30 +118,28 @@ def get_data(symbol, days):
     df['Volume_Change'] = df['Volume'].pct_change()
     df['Inst_Buy_Ratio'] = df['Inst_Net_Buy'] / (df['Volume'] + 1)
     
-    # 建立模型訓練與預測目標 (隔日漲跌幅)
+    # 目標值設定 (隔日漲跌幅)
     df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int) 
     df['Target_Price'] = df['Close'].shift(-1)                       
     df['Target_Return'] = (df['Close'].shift(-1) - df['Close']) / df['Close']
     df['Next_Date'] = df['Date'].shift(-1)                           
     
-    # 特徵清單
+    # 🌟 將夜盤特徵加入訓練清單
     features = [
         'Close', 'Volume', 'MA5', 'MA10', 'MA20', 'K', 'D', 'ATR', 'Volume_Change', 
         'Market_Return', 'Market_Trend', 'Relative_Strength', 
         'Inst_Net_Buy', 'Inst_Buy_Ratio', 
-        'ADR_Return', 'NDX_Return'
+        'ADR_Return', 'NDX_Return'  # <--- 新增這兩個夜盤/美股特徵
     ]
     df = df.dropna(subset=features).reset_index(drop=True)
     
-    # 根據選定區間切片
     return df.tail(days).reset_index(drop=True), features, name, round(price, 2)
 
-
 # ==========================================
-# ⚙️ 介面排版 (左側邊欄控制面版)
+# 介面排版與模型運算
 # ==========================================
 st.sidebar.title("⚙️ AI 指揮中心")
-st.sidebar.markdown("結合 **技術面** + **籌碼大戶** + **🌙 夜盤動能**")
+st.sidebar.markdown("結合 **技術面** + **籌碼** + **🌙 夜盤動能**")
 st.sidebar.divider()
 
 if st.sidebar.button("🚪 登出系統"):
@@ -176,67 +151,57 @@ timeframe = st.sidebar.radio("⏳ 選擇 AI 訓練區間", ("一個月 (30天)",
 days_dict = {"一個月 (30天)": 30, "一季 (90天)": 90, "半年 (180天)": 180}
 selected_days = days_dict[timeframe]
 
-
-# ==========================================
-# 📊 主畫面數據與圖表輸出
-# ==========================================
 if symbol:
-    with st.spinner(f'📡 正在同步台股日盤與美股即時動能數據...'):
+    with st.spinner(f'📡 正在同步台股日盤與美股夜盤數據...'):
         df, features, name, price = get_data(symbol, selected_days)
         
         if len(df) < 10:
             st.error("❌ 擷取到的有效交易日太少，無法訓練模型。")
             st.stop()
 
-        # 嚴謹切分：最後一天用來做未來展望預測，前面用來做歷史訓練與盲測回測
         train_df, test_df, latest_df = df.iloc[:-6], df.iloc[-6:-1], df.iloc[-1:]
         
-        # 🤖 引擎 1：方向分類器 (猜多空方向)
         model_cls = XGBClassifier(n_estimators=100, max_depth=3, random_state=42)
         model_cls.fit(train_df[features], train_df['Target'])
 
-        # 🤖 引擎 2：幅度迴歸器 (猜漲跌幅百分比)
         model_reg = XGBRegressor(n_estimators=100, max_depth=3, random_state=42)
         model_reg.fit(train_df[features], train_df['Target_Return'])
 
-        # 進行明日預測
         prob = model_cls.predict_proba(latest_df[features])[0]
         pred_trend = 1 if prob[1] > 0.5 else 0
         confidence = max(prob) * 100
         
-        # 🌟 主從同步修正邏輯
+        # --- 👇 主預測區強制同步邏輯 👇 ---
+        
+        # 1. 先算出原始的預估漲跌幅
         raw_return = model_reg.predict(latest_df[features])[0]
+        
+        # 2. 強制同步：保留迴歸器的「振幅大小 (abs)」，但方向無條件服從分類器的「趨勢 (pred_trend)」
         aligned_return = abs(raw_return) if pred_trend == 1 else -abs(raw_return)
         
-        # 使用即時股價來推算明日估值
-        pred_price = price * (1 + aligned_return)
+        # 3. 算出最終價格
+        pred_price = latest_df['Close'].values[0] * (1 + aligned_return)
 
         st.title(f"📊 {name} ({symbol})")
         st.divider()
 
-        # --- 頂部數據看板區 (4 欄並排) ---
+        # 數據看板區
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("即時收盤價", f"NT$ {price:.2f}") # 顯示兩位小數
-        col2.metric("明日趨勢預測", "📈 看漲" if pred_trend == 1 else "📉 看跌", delta=f"信心 {confidence:.1f}%", delta_color="normal" if pred_trend==1 else "inverse")
+        col1.metric("即時收盤價", f"NT$ {price}")
+        col2.metric("明日趨勢", "📈 看漲" if pred_trend == 1 else "📉 看跌", delta=f"信心 {confidence:.1f}%", delta_color="normal" if pred_trend==1 else "inverse")
         
         price_diff = pred_price - price
         col3.metric("AI 明日估值", f"NT$ {pred_price:.1f}", delta=f"預估差價: {price_diff:+.1f}", delta_color="normal" if price_diff > 0 else "inverse")
         
-        # 明日 CDP 實戰關鍵價
         high, low, close = latest_df['High'].values[0], latest_df['Low'].values[0], latest_df['Close'].values[0]
         pivot = (high + low + close) / 3
         res = (2 * pivot) - low
         sup = (2 * pivot) - high
         col4.metric("關鍵轉折價 (Pivot)", f"{pivot:.1f}")
 
-        # --- CDP 實戰警示 ---
-        if price > res:
-            st.warning(f"⚠️ 即時股價 ({price:.1f}) 已突破上方壓力線 ({res:.1f})，需留意超漲風險或拉回防守。")
-        elif price < sup:
-            st.warning(f"⚠️ 即時股價 ({price:.1f}) 已跌破下方支撐線 ({sup:.1f})，空頭氣勢強。")
-
-        # --- 🌙 跨時區動能分析面板 ---
-        st.subheader(f"🌙 跨時區動能分析 (美股即時數據連動)")
+        # 夜盤與籌碼狀態列
+        st.subheader(f"🌙 跨時區動能分析 (美股夜盤連動中)")
+        
         adr_val = latest_df['ADR_Return'].values[0] * 100
         ndx_val = latest_df['NDX_Return'].values[0] * 100
         
@@ -245,38 +210,31 @@ if symbol:
         c2.info(f"**那斯達克指數 (科技股氛圍)**\n\n👉 當前漲跌: **{ndx_val:+.2f}%**")
         
         if adr_val > 0.5 and ndx_val > 0.5:
-            night_status = "🔥 夜盤火熱，明日開高突破機率大"
+            night_status = "🔥 夜盤火熱，明日開高機率大"
         elif adr_val < -0.5 and ndx_val < -0.5:
-            night_status = "❄️ 夜盤承壓，開盤需留意探底防守"
+            night_status = "❄️ 夜盤承壓，明日需留意回檔"
         else:
-            night_status = "⚖️ 夜盤平穩，盤面走勢回歸技術面與法人籌碼"
+            night_status = "⚖️ 夜盤平穩，依循技術面與籌碼"
+            
         c3.success(f"**AI 綜合夜盤判定**\n\n👉 {night_status}")
 
         st.divider()
 
-        # --- 互動式 K 線圖區 (拉長到看近 120 天) ---
+        # K線圖
         st.subheader("📉 近期走勢與均線")
-        plot_df = df.tail(120)
+        plot_df = df.tail(60)
         fig = go.Figure(data=[go.Candlestick(x=plot_df['Date'], open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K線')])
         fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA5'], line=dict(color='orange', width=1.5), name='5日均線'))
         fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA20'], line=dict(color='blue', width=1.5), name='20日均線'))
         fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False, template="plotly_white", height=400)
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- CDP 關鍵轉折價區域示意 (Expander) ---
-        with st.expander("📝 展開查看：CDP 實戰關鍵價定義"):
-            s_c1, s_c2, s_c3, s_c4 = st.columns(4)
-            s_c1.metric("壓力RES (2*Pivot-Low)", f"{res:.1f}")
-            s_c2.metric("轉折Pivot (H+L+C)/3", f"{pivot:.1f}")
-            s_c3.metric("支撐SUP (2*Pivot-High)", f"{sup:.1f}")
-            s_c4.write("**實戰含義**：在 Pivot 之上多頭佔優，之下空頭佔優。壓力與支撐為短線強弱勢分水嶺。")
-
-        # --- 回測與決策權重 (收折區域) ---
+        # 回測與權重
         with st.expander("📝 展開查看：近 5 日回測對帳單與 AI 決策權重"):
             col_a, col_b = st.columns(2)
             
             with col_a:
-                st.markdown("**近 5 日回測結果 (同步修正版)**")
+                st.markdown("**近 5 日回測結果**")
                 correct = 0
                 for i in range(len(test_df)):
                     r = test_df.iloc[i:i+1]
@@ -287,11 +245,9 @@ if symbol:
                     p_prob = model_cls.predict_proba(r[features])[0]
                     p_trend = 1 if p_prob[1] > 0.5 else 0
                     
-                    # 🌟 盲測資料也需使用主從同步修正
+                    # --- 👇 回測區強制同步邏輯 👇 ---
                     p_raw_return = model_reg.predict(r[features])[0]
                     p_aligned_return = abs(p_raw_return) if p_trend == 1 else -abs(p_raw_return)
-                    
-                    # 回測時使用的是該日實體 K 線的 Close 來推算估值
                     p_price = r['Close'].values[0] * (1 + p_aligned_return)
                     
                     if p_trend == actual_trend: correct += 1
@@ -302,10 +258,9 @@ if symbol:
                 st.progress(correct/5, text=f"近 5 日趨勢勝率: {(correct/5)*100:.0f}%")
             
             with col_b:
-                st.markdown("**AI 趨勢決策權重 TOP 5**")
+                st.markdown("**AI 決策權重 TOP 5 (檢視夜盤影響力)**")
                 imp = pd.DataFrame({'特徵': features, '重要性': model_cls.feature_importances_}).sort_values(by='重要性', ascending=False).head(5)
                 st.bar_chart(imp.set_index('特徵'))
 
-# --- 底部免責聲明 ---
 st.divider()
 st.caption("⚠️ **免責聲明 (Disclaimer)**：本系統提供之所有數據與 AI 估值，均由歷史資料與機器學習演算法自動運算而得，僅供學術研究與投資參考，絕不構成任何買賣邀約或投資建議。投資人應審慎評估風險並自負盈虧。")
