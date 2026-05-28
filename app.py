@@ -39,7 +39,6 @@ def check_password():
 if not check_password():
     st.stop()
 
-
 # ==========================================
 # 📈 核心資料處理與特徵工程
 # ==========================================
@@ -48,21 +47,27 @@ def get_data(symbol, days):
     ticker = f"{symbol}.TW"
     stock = yf.Ticker(ticker)
     
-    # 1. 先抓取歷史資料 (確保有數據，這最穩定)
+    # 1. 先抓取歷史資料
     df = stock.history(period="250d").reset_index()
     if df.empty: 
         return df, [], f"台股 {symbol}", 0.0
         
     df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None).dt.floor('D')
     
-    # 🌟 修正點 1：強制從歷史 K 線抓取最新收盤價，徹底消滅 nan！
+    # 🌟 終極殺手鐧：把收盤價是空值 (NaN) 的「幽靈 K 線」全部強制刪除！
+    df = df.dropna(subset=['Close'])
+    
+    # 確保剔除空值後，再去抓最後一天的真實收盤價
     price = float(df['Close'].iloc[-1])
     
-    # 🌟 修正點 2：安全抓取名稱，若 yfinance 當機則預設顯示「台股 XXXX」
     try:
         name = stock.info.get('longName', stock.info.get('shortName', f"台股 {symbol}"))
     except:
         name = f"台股 {symbol}"
+    
+    # --- 下方的 大盤加權指數連動 照舊，不需要改 ---
+    # 1. 大盤加權指數連動
+    market = yf.Ticker("^TWII").history(period="250d").reset_index()
     
     # 1. 大盤加權指數連動
     market = yf.Ticker("^TWII").history(period="250d").reset_index()
