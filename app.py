@@ -12,11 +12,15 @@ st.set_page_config(page_title="AI 量化指揮中心", page_icon="📈", layout=
 # ==========================================
 # 🔒 密碼登入系統
 # ==========================================
+# ==========================================
+# 🔒 密碼登入系統 (防呆穩定版)
+# ==========================================
 def check_password():
     def password_entered():
-        if st.session_state["password"] == "8888":
+        # 🌟 修正點 1：使用 .get()，如果找不到密碼變數就不會報錯，而是回傳空字串
+        if st.session_state.get("password", "") == "8888":
             st.session_state["password_correct"] = True
-            del st.session_state["password"]
+            # 🌟 修正點 2：拿掉 del st.session_state["password"]，讓系統自己處理
         else:
             st.session_state["password_correct"] = False
 
