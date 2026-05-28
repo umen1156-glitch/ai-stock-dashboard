@@ -43,21 +43,26 @@ if not check_password():
 # ==========================================
 # 📈 核心資料處理與特徵工程
 # ==========================================
-@st.cache_data(ttl=900) # 快取時間 15 分鐘，確保盤後與夜盤即時性
+@st.cache_data(ttl=900) # 快取時間 15 分鐘
 def get_data(symbol, days):
     ticker = f"{symbol}.TW"
     stock = yf.Ticker(ticker)
-    try:
-        name = stock.info.get('longName', stock.info.get('shortName', '未知'))
-        price = stock.info.get('regularMarketPrice', stock.info.get('currentPrice', None))
-    except:
-        name, price = "未知名稱", None
-
-    # 背景固定抓取 250 天，確保長週期技術指標計算完全正確
+    
+    # 1. 先抓取歷史資料 (確保有數據，這最穩定)
     df = stock.history(period="250d").reset_index()
-    if df.empty: return df, [], name, price
+    if df.empty: 
+        return df, [], f"台股 {symbol}", 0.0
+        
     df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None).dt.floor('D')
-    if price is None: price = df['Close'].iloc[-1]
+    
+    # 🌟 修正點 1：強制從歷史 K 線抓取最新收盤價，徹底消滅 nan！
+    price = float(df['Close'].iloc[-1])
+    
+    # 🌟 修正點 2：安全抓取名稱，若 yfinance 當機則預設顯示「台股 XXXX」
+    try:
+        name = stock.info.get('longName', stock.info.get('shortName', f"台股 {symbol}"))
+    except:
+        name = f"台股 {symbol}"
     
     # 1. 大盤加權指數連動
     market = yf.Ticker("^TWII").history(period="250d").reset_index()
