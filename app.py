@@ -39,37 +39,49 @@ def check_password():
 if not check_password():
     st.stop()
 
+
 # ==========================================
 # 📈 核心資料處理與特徵工程
 # ==========================================
-@st.cache_data(ttl=900) # 快取時間 15 分鐘
+@st.cache_data(ttl=300) # 🌟 修正點 1：將快取TTL縮短為 300 秒 (5分鐘)，提高即時性
 def get_data(symbol, days):
     ticker = f"{symbol}.TW"
     stock = yf.Ticker(ticker)
     
-    # 1. 先抓取歷史資料
+    # --- 1. 抓取歷史日線資料 (用於 AI 訓練與均線計算) ---
+    # 背景固定抓取 250 天，確保長週期技術指標計算完全正確
     df = stock.history(period="250d").reset_index()
-    if df.empty: 
-        return df, [], f"台股 {symbol}", 0.0
-        
+    if df.empty: return df, [], f"台股 {symbol}", 0.0
+    
     df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None).dt.floor('D')
     
-    # 🌟 終極殺手鐧：把收盤價是空值 (NaN) 的「幽靈 K 線」全部強制刪除！
+    # 強制刪除收盤價為 NaN 的幽靈 K 線
     df = df.dropna(subset=['Close'])
     
-    # 確保剔除空值後，再去抓最後一天的真實收盤價
+    # 基設股價 (預設為昨天收盤價，防止今日未開盤時報錯)
     price = float(df['Close'].iloc[-1])
     
+    # 🌟 修正點 2：安全抓取名稱，若 yfinance 當機則預設顯示「台股 XXXX」
     try:
         name = stock.info.get('longName', stock.info.get('shortName', f"台股 {symbol}"))
     except:
         name = f"台股 {symbol}"
     
-    # --- 下方的 大盤加權指數連動 照舊，不需要改 ---
-    # 1. 大盤加權指數連動
-    market = yf.Ticker("^TWII").history(period="250d").reset_index()
-    
-    # 1. 大盤加權指數連動
+    # 🌟 修正點 3：新增盤中即時報價抓取邏輯
+    # 單獨抓取今天的 1 分鐘 K 線，只取最後一筆
+    try:
+        # yf.download 抓取今日 1d 資料，interval 設為 1m
+        today_fetch = yf.download(ticker, period="1d", interval="1m", progress=False)
+        if not today_fetch.empty:
+            # 找到最後一個有效的成交價
+            last_valid_price = today_fetch['Close'].ffill().iloc[-1]
+            if not pd.isna(last_valid_price):
+                price = float(last_valid_price)
+    except Exception as e:
+        # 如果抓取即時資料失敗 (例如 yfinance API 流量限制)，則延用日線最後一筆價格 (昨天收盤價)
+        pass
+
+    # 1. 大盤加權指數連動 (日盤)
     market = yf.Ticker("^TWII").history(period="250d").reset_index()
     if not market.empty:
         market['Date'] = pd.to_datetime(market['Date']).dt.tz_localize(None).dt.floor('D')
@@ -129,7 +141,7 @@ def get_data(symbol, days):
     df['Volume_Change'] = df['Volume'].pct_change()
     df['Inst_Buy_Ratio'] = df['Inst_Net_Buy'] / (df['Volume'] + 1)
     
-    # 建立模型訓練與預測目標
+    # 建立模型訓練與預測目標 (隔日漲跌幅)
     df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int) 
     df['Target_Price'] = df['Close'].shift(-1)                       
     df['Target_Return'] = (df['Close'].shift(-1) - df['Close']) / df['Close']
@@ -169,11 +181,11 @@ selected_days = days_dict[timeframe]
 # 📊 主畫面數據與圖表輸出
 # ==========================================
 if symbol:
-    with st.spinner(f'📡 正在同步台股日盤與美股夜盤數據...'):
+    with st.spinner(f'📡 正在同步台股日盤與美股即時動能數據...'):
         df, features, name, price = get_data(symbol, selected_days)
         
         if len(df) < 10:
-            st.error("❌ 擷取到的有效交易日太少，無法訓練模型。請嘗試更長的時間區間。")
+            st.error("❌ 擷取到的有效交易日太少，無法訓練模型。")
             st.stop()
 
         # 嚴謹切分：最後一天用來做未來展望預測，前面用來做歷史訓練與盲測回測
@@ -192,17 +204,19 @@ if symbol:
         pred_trend = 1 if prob[1] > 0.5 else 0
         confidence = max(prob) * 100
         
-        # 🌟 主從同步修正點：利用老大(分類器)的方向，強制修正小弟(迴歸器)的正負號
+        # 🌟 主從同步修正邏輯
         raw_return = model_reg.predict(latest_df[features])[0]
         aligned_return = abs(raw_return) if pred_trend == 1 else -abs(raw_return)
-        pred_price = latest_df['Close'].values[0] * (1 + aligned_return)
+        
+        # 使用即時股價來推算明日估值
+        pred_price = price * (1 + aligned_return)
 
         st.title(f"📊 {name} ({symbol})")
         st.divider()
 
         # --- 頂部數據看板區 (4 欄並排) ---
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("即時收盤價", f"NT$ {price}")
+        col1.metric("即時收盤價", f"NT$ {price:.2f}") # 顯示兩位小數
         col2.metric("明日趨勢預測", "📈 看漲" if pred_trend == 1 else "📉 看跌", delta=f"信心 {confidence:.1f}%", delta_color="normal" if pred_trend==1 else "inverse")
         
         price_diff = pred_price - price
@@ -214,6 +228,12 @@ if symbol:
         res = (2 * pivot) - low
         sup = (2 * pivot) - high
         col4.metric("關鍵轉折價 (Pivot)", f"{pivot:.1f}")
+
+        # --- CDP 實戰警示 ---
+        if price > res:
+            st.warning(f"⚠️ 即時股價 ({price:.1f}) 已突破上方壓力線 ({res:.1f})，需留意超漲風險或拉回防守。")
+        elif price < sup:
+            st.warning(f"⚠️ 即時股價 ({price:.1f}) 已跌破下方支撐線 ({sup:.1f})，空頭氣勢強。")
 
         # --- 🌙 跨時區動能分析面板 ---
         st.subheader(f"🌙 跨時區動能分析 (美股即時數據連動)")
@@ -234,14 +254,22 @@ if symbol:
 
         st.divider()
 
-        # --- 互動式 K 線圖區 ---
+        # --- 互動式 K 線圖區 (拉長到看近 120 天) ---
         st.subheader("📉 近期走勢與均線")
-        plot_df = df.tail(60)
+        plot_df = df.tail(120)
         fig = go.Figure(data=[go.Candlestick(x=plot_df['Date'], open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K線')])
         fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA5'], line=dict(color='orange', width=1.5), name='5日均線'))
         fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA20'], line=dict(color='blue', width=1.5), name='20日均線'))
         fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False, template="plotly_white", height=400)
         st.plotly_chart(fig, use_container_width=True)
+
+        # --- CDP 關鍵轉折價區域示意 (Expander) ---
+        with st.expander("📝 展開查看：CDP 實戰關鍵價定義"):
+            s_c1, s_c2, s_c3, s_c4 = st.columns(4)
+            s_c1.metric("壓力RES (2*Pivot-Low)", f"{res:.1f}")
+            s_c2.metric("轉折Pivot (H+L+C)/3", f"{pivot:.1f}")
+            s_c3.metric("支撐SUP (2*Pivot-High)", f"{sup:.1f}")
+            s_c4.write("**實戰含義**：在 Pivot 之上多頭佔優，之下空頭佔優。壓力與支撐為短線強弱勢分水嶺。")
 
         # --- 回測與決策權重 (收折區域) ---
         with st.expander("📝 展開查看：近 5 日回測對帳單與 AI 決策權重"):
@@ -259,9 +287,11 @@ if symbol:
                     p_prob = model_cls.predict_proba(r[features])[0]
                     p_trend = 1 if p_prob[1] > 0.5 else 0
                     
-                    # 🌟 歷史盲測資料的強制主從同步修正
+                    # 🌟 盲測資料也需使用主從同步修正
                     p_raw_return = model_reg.predict(r[features])[0]
                     p_aligned_return = abs(p_raw_return) if p_trend == 1 else -abs(p_raw_return)
+                    
+                    # 回測時使用的是該日實體 K 線的 Close 來推算估值
                     p_price = r['Close'].values[0] * (1 + p_aligned_return)
                     
                     if p_trend == actual_trend: correct += 1
